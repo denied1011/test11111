@@ -1,117 +1,124 @@
-cat << 'EOF' > /tmp/check_fix.sh && chmod +x /tmp/check_fix.sh && bash /tmp/check_fix.sh && rm /tmp/check_fix.sh
 #!/bin/bash
-# TC|_|Y v0.1.4-OpenWrt - Fix for routers (nslookup + sequential check)
 
+# Цвета
 G='\033[0;32m'; R='\033[0;31m'; B='\033[0;34m'; NC='\033[0m'
 
-read -p "Укажите ссылку или домен: " INPUT
+echo -e "${B}=== OpenWrt V2Ray/Xray Checker ===${NC}"
+read -p "Вставьте ссылку на подписку: " URL
 
-# Функция резолва через nslookup (так как host нет по умолчанию)
-get_ip() {
-    local target=$(echo "$1" | tr -d '"'\''/ ')
-    if [[ "$target" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-        echo "$target"
-    else
-        # Используем nslookup и парсим вывод
-        nslookup "$target" 2>/dev/null | grep -oE "([0-9]{1,3}\.){3}[0-9]{1,3}" | tail -n1 | grep -v "0.0.0.0"
+# Функция для получения IP через nslookup (адаптирована для BusyBox)
+resolve_ip() {
+    local host="$1"
+    # Если это уже IP - возвращаем его
+    if [[ "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "$host"
+        return
     fi
+    # Пытаемся резолвить. Ищем строку с "Address" и берем последний IP (обычно IPv4)
+    nslookup "$host" 2>/dev/null | awk '/Address/ { print $3 }' | grep -v ":" | grep -E '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n1
 }
 
-echo -ne "${B}==> Получение данных... ${NC}"
+# 1. Скачивание
+echo -ne "${B}Скачивание... ${NC}"
+# Используем -k (insecure) на случай проблем с SSL и User-Agent от Chrome
+RAW_DATA=$(curl -sL -k -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36" --connect-timeout 10 "$URL")
 
-if [[ $INPUT == http* ]]; then
-    # Пробуем скачать
-    BODY=$(curl -sL -k --connect-timeout 15 "$INPUT")
-    
-    if [[ -z "$BODY" ]]; then
-        echo -e "${R}Ошибка: Пустой ответ от сервера. Проверьте ссылку.${NC}"
-        exit 1
-    fi
-    echo -e "${G}DONE (${#BODY} байт)${NC}"
+if [[ -z "$RAW_DATA" ]]; then
+    echo -e "${R}Ошибка! Пустой ответ.${NC}"
+    echo "Проверьте ссылку или интернет на роутере (ping 8.8.8.8)."
+    exit 1
+fi
+echo -e "${G}OK (${#RAW_DATA} байт)${NC}"
 
-    NODES_LIST=""
-    # Поиск ссылок
-    NODES_LIST+=$(echo "$BODY" | grep -oE '(vless|vmess|trojan|ss|ssr)://[^@]+@[^:/]+' | sed -E 's/.*@//' | cut -d':' -f1)
-    NODES_LIST+=$'\n'
+# 2. Подготовка и Декодирование
+# Сначала ищем ссылки в явном виде
+NODES=$(echo "$RAW_DATA" | grep -oE '(vless|vmess|trojan|ss|ssr)://[^[:space:]"<>]+')
+
+# Если явных ссылок мало, пробуем декодировать Base64
+if [[ -z "$NODES" ]]; then
+    echo -ne "${B}Декодирование Base64... ${NC}"
     
-    # Декод Base64
-    DECODED=$(echo "$BODY" | tr '_-' '/+' | base64 -d 2>/dev/null)
-    if [[ -n "$DECODED" ]]; then
-        NODES_LIST+=$(echo "$DECODED" | grep -oE '(vless|vmess|trojan|ss|ssr)://[^@]+@[^:/]+' | sed -E 's/.*@//' | cut -d':' -f1)
-        NODES_LIST+=$'\n'
-        NODES_LIST+=$(echo "$DECODED" | grep -oE '[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}' | grep -vE '^(null|true|false)$')
+    # Очистка мусора и нормализация Base64 (замена -_ на +/)
+    CLEAN_B64=$(echo "$RAW_DATA" | tr -d '\n\r ' | tr '-_' '+/')
+    
+    # Добиваем "=" до кратности 4 (padding), иначе base64 упадет
+    REM=$((${#CLEAN_B64} % 4))
+    if [ $REM -eq 2 ]; then CLEAN_B64="${CLEAN_B64}=="; fi
+    if [ $REM -eq 3 ]; then CLEAN_B64="${CLEAN_B64}="; fi
+
+    # Декодируем (используем coreutils-base64 если есть, или встроенный)
+    DECODED=$(echo "$CLEAN_B64" | base64 -d 2>/dev/null)
+    
+    # Ищем ссылки внутри декодированного
+    NODES=$(echo "$DECODED" | grep -oE '(vless|vmess|trojan|ss|ssr)://[^[:space:]"<>]+')
+    
+    if [[ -n "$NODES" ]]; then
+        echo -e "${G}Успешно${NC}"
+    else
+        echo -e "${R}Не найдено${NC}"
+        # Последний шанс: ищем просто IP/Домены в decoded тексте (для старых форматов)
+        NODES=$(echo "$DECODED" | grep -oE '[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}' | grep -vE 'google|github|cloudflare')
     fi
-    
-    # Грубый поиск IP/Доменов
-    NODES_LIST+=$(echo "$BODY" | grep -oE '[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}' | grep -vE '^(null|true|false|www|api|cdn|http|https|github|google|cloudflare|nginx|title|body|center|hr|html|div|span|class)$')
-    NODES_LIST+=$'\n'
-    NODES_LIST+=$(echo "$BODY" | grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' | grep -vE '^(0\.0\.0\.0|127\.|192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.)')
-    
-    NODES_LIST=$(echo "$NODES_LIST" | sort -u | grep -v '^$')
-else
-    # Режим домена
-    echo -ne "${B}Разведка домена... ${NC}"
-    NODES_LIST=$(curl -s "https://crt.sh/?q=%25.$INPUT&output=json" | jq -r '.[].name_value' 2>/dev/null | sed 's/\*\.//g' | tr ' ' '\n' | sort -u)
-    [[ -z "$NODES_LIST" || "$NODES_LIST" == "null" ]] && NODES_LIST="$INPUT"
-    echo -e "${G}OK${NC}"
 fi
 
-echo -e "${B}==> Резолв DNS...${NC}"
-declare -A DNS_MAP; FINAL_IPS=""
-for d in $NODES_LIST; do
-    IP=$(get_ip "$d")
-    if [[ ! -z "$IP" && "$IP" != "127.0.0.1" ]]; then
-         DNS_MAP[$IP]=$d
-         FINAL_IPS+="$IP "
-         # echo -n "." # раскомментируйте для прогресс-бара
+# 3. Извлечение хостов/IP из ссылок
+HOST_LIST=""
+for node in $NODES; do
+    # Убираем префикс протокола
+    noprot=$(echo "$node" | sed -E 's/^(vless|vmess|trojan|ss|ssr):\/\///')
+    
+    # Парсинг vmess (часто зашифрован еще раз в json base64, но мы ищем адрес "в лоб")
+    # Простейший вариант: ищем то, что после @ (vless/trojan) или просто пробуем найти домен
+    
+    # Попытка вырезать адрес после @ и до :
+    addr_part=$(echo "$noprot" | grep -oE '@[a-zA-Z0-9.-]+' | sed 's/@//')
+    
+    # Если не вышло (vmess), ищем json "add":"..." или "host":"..."
+    if [[ -z "$addr_part" ]]; then
+        # Это хак для vmess, раскодировать каждую строку долго. 
+        # Мы просто поищем домены в исходном декодированном тексте ранее.
+        continue 
     fi
+    HOST_LIST+="$addr_part "
 done
-echo ""
 
-NODES=($(echo "$FINAL_IPS" | tr ' ' '\n' | sort -u))
+# Если список пуст, берем "грязный" список доменов из текста
+if [[ -z "$HOST_LIST" ]]; then
+    HOST_LIST=$(echo "$DECODED" "$RAW_DATA" | grep -oE '[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}' | grep -vE '^(null|true|false|www|api|cdn|http|https|github|google|cloudflare|nginx|title|body|center|hr|html|div|span|class)$' | sort -u)
+fi
 
-if [[ ${#NODES[@]} -eq 0 ]]; then
-    echo -e "${R}Ошибка: Узлы не найдены после фильтрации.${NC}"
-    echo "Возможно, скрипт не смог распознать формат подписки или DNS не работает."
+# 4. Проверка
+echo -e "\n${B}==> Начинаем проверку доступности <==${NC}"
+printf "%-20s | %-15s | %-10s | %s\n" "Хост/Домен" "IP Адрес" "Порт 443" "Вердикт"
+echo "----------------------------------------------------------------"
+
+# Убираем дубликаты
+UNIQUE_HOSTS=$(echo "$HOST_LIST" | tr ' ' '\n' | sort -u | grep -v "^$")
+
+if [[ -z "$UNIQUE_HOSTS" ]]; then
+    echo -e "${R}КРИТИЧЕСКАЯ ОШИБКА: Не удалось извлечь ни одного адреса.${NC}"
     exit 1
 fi
 
-printf "\n${B}%-15s | %-25s | %-6s | %-4s | %-8s | %s${NC}\n" "IP" "Хост" "Статус" "Гео" "ASN" "Вердикт"
-echo "----------------------------------------------------------------------------------"
-
-# Функция проверки одного узла
-audit_node() {
-    local ip=$1
-    local name="${DNS_MAP[$ip]}"
+for host in $UNIQUE_HOSTS; do
+    # Резолвим IP
+    IP=$(resolve_ip "$host")
     
-    # Проверка порта (nc быстрее и есть в openwrt, но проверим через /dev/tcp для совместимости с bash)
-    if (echo >/dev/tcp/"$ip"/443) &>/dev/null; then
-        ST="OK"
+    if [[ -z "$IP" ]]; then
+        printf "%-20.20s | %-15s | %-10s | %s\n" "$host" "???" "SKIP" "DNS Fail"
+        continue
+    fi
+
+    # Проверка порта 443 (используем nc так как /dev/tcp может не работать в sh)
+    if nc -z -w 2 "$IP" 443 2>/dev/null; then
+        STATUS="${G}OPEN${NC}"
+        VERDICT="Alive"
     else
-        ST="BAN"
+        STATUS="${R}FAIL${NC}"
+        VERDICT="Blocked/Down"
     fi
     
-    # Инфо об IP
-    RAW=$(curl -s --connect-timeout 2 "http://ip-api.com/csv/$ip?fields=countryCode,as")
-    CO=$(echo "$RAW" | cut -d',' -f1 | tr -d '"')
-    AS=$(echo "$RAW" | cut -d',' -f2 | grep -oE 'AS[0-9]+' | head -n1)
-    
-    [[ -z "$CO" ]] && CO="??"
-    [[ -z "$AS" ]] && AS="AS?"
-    
-    if [[ "$ST" == "OK" ]]; then
-        C=$G; VERDICT="Alive"
-    else
-        C=$R; VERDICT="Blocked"
-    fi
-    
-    printf "${C}%-15s | %-25.25s | %-6s | [%-2s] | %-8s | %s${NC}\n" "$ip" "$name" "$ST" "$CO" "$AS" "$VERDICT"
-}
-
-# Последовательный запуск (без xargs -P, чтобы не крашить роутер)
-for ip in "${NODES[@]}"; do
-    audit_node "$ip"
+    printf "%-20.20s | %-15s | %-10s | %s\n" "$host" "$IP" "$STATUS" "$VERDICT"
 done
-
 echo ""
 EOF
