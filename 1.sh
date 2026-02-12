@@ -1,15 +1,12 @@
 #!/bin/bash
 
-# === OpenWrt Checker v3.1 (Fixed 30 chars width) ===
-# Имена строго 30 символов, кириллица поддерживается, эмодзи удалены.
+# === OpenWrt Checker v3.2 (Final Stable) ===
 
 G='\033[0;32m'; R='\033[0;31m'; Y='\033[1;33m'; NC='\033[0m'
 
 URL="$1"
-if [[ -z "$URL" ]]; then
-    read -p "Вставьте ссылку: " URL
-fi
-[ -z "$URL" ] && exit 1
+[[ -z "$URL" ]] && read -p "Вставьте ссылку: " URL
+[[ -z "$URL" ]] && exit 1
 
 get_ip() {
     nslookup "$1" 8.8.8.8 2>/dev/null | awk '/^Address: / { print $2 }' | grep -v ":" | tail -n1
@@ -21,24 +18,21 @@ urldecode() {
 
 echo -ne "Скачивание... "
 RAW=$(curl -sL -k --connect-timeout 10 -A "Mozilla/5.0" "$URL")
-[ -z "$RAW" ] && { echo "Ошибка"; exit 1; }
+[[ -z "$RAW" ]] && { echo "Ошибка"; exit 1; }
 echo "OK"
 
-echo "Обработка..."
 LINKS=$(echo "$RAW" | grep -oE '(vless|vmess|trojan|ss|ssr)://[^"'\''<>[:space:]]+')
-
 if [[ -z "$LINKS" ]]; then
     CLEAN=$(echo "$RAW" | sed 's/<[^>]*>//g' | tr -d '\n\r ' | sed 's/-/+/g; s/_/\//g')
     DECODED=$(echo "$CLEAN" | base64 -d 2>/dev/null)
     LINKS=$(echo "$DECODED" | grep -oE '(vless|vmess|trojan|ss|ssr)://[^"'\''<>[:space:]]+')
 fi
 
-[ -z "$LINKS" ] && { echo "Узлы не найдены"; exit 1; }
+[[ -z "$LINKS" ]] && { echo "Узлы не найдены"; exit 1; }
 
-# Печать шапки (Имя - 30 символов)
-echo "----------------------------------------------------------------------------------------------------"
-printf "| %-30s | %-22s | %-15s | %b\n" "ИМЯ" "SNI / ХОСТ" "IP АДРЕС" "СТАТУС"
-echo "----------------------------------------------------------------------------------------------------"
+echo "------------------------------------------------------------------------------------------------------"
+printf "| %-30s | %-25s | %-15s | %b\n" "ИМЯ" "SNI / ХОСТ" "IP АДРЕС" "СТАТУС"
+echo "------------------------------------------------------------------------------------------------------"
 
 IFS=$'\n'
 for link in $LINKS; do
@@ -57,22 +51,24 @@ for link in $LINKS; do
 
     [[ -z "$HOST" ]] || echo "$HOST" | grep -qE '^127\.|^192\.168\.|^10\.' && continue
 
-    # --- ОЧИСТКА И ФИКСИРОВАННАЯ ДЛИНА ---
-    # Удаляем всё кроме букв, цифр, пробелов и знаков - _ .
-    CLEAN_NAME=$(echo "$NAME" | sed 's/[^a-zA-Z0-9а-яА-ЯёЁ ._-]//g' | sed 's/^ *//;s/ *$//')
+    # --- УЛУЧШЕННАЯ ОЧИСТКА ИМЕНИ ---
+    # 1. Удаляем все непечатаемые символы (битую кодировку от эмодзи)
+    # 2. Оставляем только буквы, цифры и базовые знаки
+    CLEAN_NAME=$(echo "$NAME" | tr -cd '[:alnum:][:space:].\-_а-яА-ЯёЁ')
+    CLEAN_NAME=$(echo "$CLEAN_NAME" | sed 's/^ *//;s/ *$//')
     [[ -z "$CLEAN_NAME" ]] && CLEAN_NAME="Node"
 
     IP=$(get_ip "$HOST")
     if [[ -z "$IP" ]]; then
-        printf "| %-30.30s | %-22.22s | %-15s | %b\n" "$CLEAN_NAME" "$HOST" "???" "${Y}DNS Error${NC}"
+        printf "| %-30.30s | %-25.25s | %-15s | %b\n" "$CLEAN_NAME" "$HOST" "???" "${Y}DNS Error${NC}"
         continue
     fi
     
     curl -I -k --connect-timeout 2 "https://$IP" >/dev/null 2>&1 && STATUS="${G}Активно${NC}" || STATUS="${R}Блок РКН${NC}"
     
-    # Вывод: Имя строго 30 знакомест, обрезка на 30 символах
-    printf "| %-30.30s | %-22.22s | %-15s | %b\n" "$CLEAN_NAME" "$HOST" "$IP" "$STATUS"
+    # Печать с жесткими границами (30 - 25 - 15)
+    printf "| %-30.30s | %-25.25s | %-15s | %b\n" "$CLEAN_NAME" "$HOST" "$IP" "$STATUS"
     
 done
 unset IFS
-echo "----------------------------------------------------------------------------------------------------"
+echo "------------------------------------------------------------------------------------------------------"
