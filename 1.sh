@@ -1,124 +1,99 @@
 #!/bin/bash
 
-# Цвета
 G='\033[0;32m'; R='\033[0;31m'; B='\033[0;34m'; NC='\033[0m'
 
-echo -e "${B}=== OpenWrt V2Ray/Xray Checker ===${NC}"
-read -p "Вставьте ссылку на подписку: " URL
+echo -e "${B}=== OpenWrt V2Ray Checker (Fix v3) ===${NC}"
+read -p "Вставьте ссылку: " URL
 
-# Функция для получения IP через nslookup (адаптирована для BusyBox)
+# Функция для получения IP
 resolve_ip() {
     local host="$1"
-    # Если это уже IP - возвращаем его
-    if [[ "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    # Если это IP
+    if echo "$host" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
         echo "$host"
-        return
+    else
+        # nslookup в OpenWrt специфичен
+        nslookup "$host" 2>/dev/null | awk '/^Address: / { print $2 }' | grep -v ":" | tail -n1
     fi
-    # Пытаемся резолвить. Ищем строку с "Address" и берем последний IP (обычно IPv4)
-    nslookup "$host" 2>/dev/null | awk '/Address/ { print $3 }' | grep -v ":" | grep -E '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n1
 }
 
-# 1. Скачивание
 echo -ne "${B}Скачивание... ${NC}"
-# Используем -k (insecure) на случай проблем с SSL и User-Agent от Chrome
-RAW_DATA=$(curl -sL -k -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36" --connect-timeout 10 "$URL")
+RAW=$(curl -sL -k --connect-timeout 10 "$URL")
 
-if [[ -z "$RAW_DATA" ]]; then
-    echo -e "${R}Ошибка! Пустой ответ.${NC}"
-    echo "Проверьте ссылку или интернет на роутере (ping 8.8.8.8)."
+if [[ -z "$RAW" ]]; then
+    echo -e "${R}Пусто!${NC}"
     exit 1
 fi
-echo -e "${G}OK (${#RAW_DATA} байт)${NC}"
+echo -e "${G}OK (${#RAW} байт)${NC}"
 
-# 2. Подготовка и Декодирование
-# Сначала ищем ссылки в явном виде
-NODES=$(echo "$RAW_DATA" | grep -oE '(vless|vmess|trojan|ss|ssr)://[^[:space:]"<>]+')
-
-# Если явных ссылок мало, пробуем декодировать Base64
-if [[ -z "$NODES" ]]; then
+# === БЛОК ДЕКОДИРОВАНИЯ (ИСПРАВЛЕННЫЙ) ===
+# Проверяем, закодирован ли файл (нет явных ссылок vless/vmess)
+if ! echo "$RAW" | grep -qE "vless://|vmess://|trojan://|ss://"; then
     echo -ne "${B}Декодирование Base64... ${NC}"
     
-    # Очистка мусора и нормализация Base64 (замена -_ на +/)
-    CLEAN_B64=$(echo "$RAW_DATA" | tr -d '\n\r ' | tr '-_' '+/')
+    # 1. Убираем пробелы и переносы
+    CLEAN=$(echo "$RAW" | tr -d '\n\r ')
     
-    # Добиваем "=" до кратности 4 (padding), иначе base64 упадет
-    REM=$((${#CLEAN_B64} % 4))
-    if [ $REM -eq 2 ]; then CLEAN_B64="${CLEAN_B64}=="; fi
-    if [ $REM -eq 3 ]; then CLEAN_B64="${CLEAN_B64}="; fi
+    # 2. Заменяем URL-safe символы (- и _) на стандартные (+ и /)
+    # ИСПОЛЬЗУЕМ SED ВМЕСТО TR, чтобы избежать ошибки "unrecognized option"
+    CLEAN=$(echo "$CLEAN" | sed 's/-/+/g' | sed 's/_/\//g')
 
-    # Декодируем (используем coreutils-base64 если есть, или встроенный)
-    DECODED=$(echo "$CLEAN_B64" | base64 -d 2>/dev/null)
+    # 3. Добавляем паддинг (=), если длина не кратна 4
+    LEN=${#CLEAN}
+    MOD=$((LEN % 4))
+    if [ $MOD -eq 2 ]; then CLEAN="${CLEAN}=="; fi
+    if [ $MOD -eq 3 ]; then CLEAN="${CLEAN}="; fi
+
+    # 4. Декодируем
+    DECODED=$(echo "$CLEAN" | base64 -d 2>/dev/null)
     
-    # Ищем ссылки внутри декодированного
-    NODES=$(echo "$DECODED" | grep -oE '(vless|vmess|trojan|ss|ssr)://[^[:space:]"<>]+')
-    
-    if [[ -n "$NODES" ]]; then
-        echo -e "${G}Успешно${NC}"
+    # Если base64 не сработал, вернем исходник (вдруг это просто список IP)
+    if [[ -z "$DECODED" ]]; then
+        TEXT="$RAW"
+        echo -e "${R}Ошибка декодирования (пробуем как текст)${NC}"
     else
-        echo -e "${R}Не найдено${NC}"
-        # Последний шанс: ищем просто IP/Домены в decoded тексте (для старых форматов)
-        NODES=$(echo "$DECODED" | grep -oE '[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}' | grep -vE 'google|github|cloudflare')
+        TEXT="$DECODED"
+        echo -e "${G}OK${NC}"
     fi
+else
+    TEXT="$RAW"
 fi
+# ==========================================
 
-# 3. Извлечение хостов/IP из ссылок
-HOST_LIST=""
-for node in $NODES; do
-    # Убираем префикс протокола
-    noprot=$(echo "$node" | sed -E 's/^(vless|vmess|trojan|ss|ssr):\/\///')
-    
-    # Парсинг vmess (часто зашифрован еще раз в json base64, но мы ищем адрес "в лоб")
-    # Простейший вариант: ищем то, что после @ (vless/trojan) или просто пробуем найти домен
-    
-    # Попытка вырезать адрес после @ и до :
-    addr_part=$(echo "$noprot" | grep -oE '@[a-zA-Z0-9.-]+' | sed 's/@//')
-    
-    # Если не вышло (vmess), ищем json "add":"..." или "host":"..."
-    if [[ -z "$addr_part" ]]; then
-        # Это хак для vmess, раскодировать каждую строку долго. 
-        # Мы просто поищем домены в исходном декодированном тексте ранее.
-        continue 
-    fi
-    HOST_LIST+="$addr_part "
-done
+echo -e "${B}Парсинг узлов...${NC}"
+# Ищем всё, что похоже на домен или IP
+# Исключаем мусорные слова, характерные для конфигов (log, dns, routing и т.д.)
+HOSTS=$(echo "$TEXT" | grep -oE '[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}' | grep -vE '^(vless|vmess|trojan|ss|tcp|udp|http|https|www|google|github|cloudflare|microsoft|instagram|facebook|telegram|whatsapp|twitter|youtube|netflix|disney|hbo|prime|apple|amazonaws|azure|digitalocean|oracle|alibaba|tencent|baidu|yandex|mail|vk|ok|dzen|rutube|tiktok|twitch|steam|epicgames|origin|uplay|blizzard|riotgames|gog|itch|discord|slack|skype|zoom|teams|webex|meet|jitsi|signal|viber|threema|wire|wickr|session|matrix|element|rocket|mattermost|zulip|irc|xmpp|jabber|mumble|teamspeak|ventrilo|raidcall|curse|curseforge|overwolf|faceit|esea|battlefy|challonge|smashgg|startgg|toornament|binarybeast|battlefly|img|png|jpg|jpeg|gif|css|js|json|html|xml|php|asp|aspx|jsp|do|action|cgi|pl|py|rb|sh|bat|cmd|exe|msi|apk|ipa|dmg|iso|zip|rar|7z|tar|gz|bz2|xz|zst|lz4|lzh|arj|cab|deb|rpm|jar|war|ear|sar|nar|kar|gar|par|xar|dar|cpio|shar|lshar|gshar|mshar|ashar|zshar|sharutils|uudecode|b64decode|base64|uuencode|b64encode|openssl|gpg|pgp|ssh|scp|sftp|ftp|telnet|rsh|rlogin|rexec|rcp|rsync|git|svn|hg|bzr|cvs|rcs|sccs|bk|bitkeeper|tla|arch|monotone|darcs|fossil|veracity|plastic|plasticscm|accurev|clearcase|synergy|cm|cmvc|cm synergy|pvcs|vm|vms|vmanager|harvest|dimensions|starteam|mks|integrity|perforce|p4|helix|bitbucket|gitlab|gitea|gogs|phabricator|kallithea|rhodecode|tfs|vsts|ado|azure devops|jira|confluence|bamboo|crucible|fisheye|upsource|youtrack|teamcity|hub|jetbrains|idea|clion|pycharm|webstorm|phpstorm|rubymine|appcode|datagrip|goland|rider|mps|android studio|xcode|visual studio|vscode|sublime|atom|brackets|notepad|vim|emacs|nano|pico|ed|sed|awk|grep|find|locate|which|whereis|whatis|man|info|help|alias|unalias|export|unset|set|env|printenv|echo|printf|read|readlink|realpath|basename|dirname|stat|touch|mkdir|rmdir|rm|mv|cp|ln|link|unlink|chmod|chown|chgrp|umask|useradd|usermod|userdel|groupadd|groupmod|groupdel|passwd|chage|chfn|chsh|su|sudo|doas|visudo|id|who|w|users|last|lastb|lastlog|wall|write|mesg|talk|uptime|proc|sys|dev|run|tmp|var|etc|usr|bin|sbin|lib|lib64|opt|mnt|media|srv|home|root|boot)$' | sort -u)
 
-# Если список пуст, берем "грязный" список доменов из текста
-if [[ -z "$HOST_LIST" ]]; then
-    HOST_LIST=$(echo "$DECODED" "$RAW_DATA" | grep -oE '[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}' | grep -vE '^(null|true|false|www|api|cdn|http|https|github|google|cloudflare|nginx|title|body|center|hr|html|div|span|class)$' | sort -u)
-fi
+# Добавляем IP адреса напрямую (если они есть в конфиге)
+IPS=$(echo "$TEXT" | grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' | grep -vE '^(127\.|10\.|172\.|192\.168\.|0\.)')
 
-# 4. Проверка
-echo -e "\n${B}==> Начинаем проверку доступности <==${NC}"
-printf "%-20s | %-15s | %-10s | %s\n" "Хост/Домен" "IP Адрес" "Порт 443" "Вердикт"
-echo "----------------------------------------------------------------"
+ALL_NODES="$HOSTS $IPS"
+UNIQUE_NODES=$(echo "$ALL_NODES" | tr ' ' '\n' | sort -u | grep -v "^$")
 
-# Убираем дубликаты
-UNIQUE_HOSTS=$(echo "$HOST_LIST" | tr ' ' '\n' | sort -u | grep -v "^$")
-
-if [[ -z "$UNIQUE_HOSTS" ]]; then
-    echo -e "${R}КРИТИЧЕСКАЯ ОШИБКА: Не удалось извлечь ни одного адреса.${NC}"
+if [[ -z "$UNIQUE_NODES" ]]; then
+    echo -e "${R}Узлы не найдены. Возможно формат подписки нестандартный.${NC}"
     exit 1
 fi
 
-for host in $UNIQUE_HOSTS; do
-    # Резолвим IP
-    IP=$(resolve_ip "$host")
+printf "\n%-25s | %-15s | %-6s\n" "Хост" "IP" "Статус"
+echo "--------------------------------------------------------"
+
+for node in $UNIQUE_NODES; do
+    # Пытаемся резолвить
+    IP=$(resolve_ip "$node")
     
     if [[ -z "$IP" ]]; then
-        printf "%-20.20s | %-15s | %-10s | %s\n" "$host" "???" "SKIP" "DNS Fail"
-        continue
+        continue # Пропускаем, если DNS не ответил
     fi
 
-    # Проверка порта 443 (используем nc так как /dev/tcp может не работать в sh)
+    # Проверка порта 443 через netcat (nc)
+    # -z: сканирование, -w 2: таймаут 2 сек
     if nc -z -w 2 "$IP" 443 2>/dev/null; then
-        STATUS="${G}OPEN${NC}"
-        VERDICT="Alive"
+        echo -e "${G}%-25.25s | %-15s | OPEN${NC}" "$node" "$IP"
     else
-        STATUS="${R}FAIL${NC}"
-        VERDICT="Blocked/Down"
+        echo -e "${R}%-25.25s | %-15s | FAIL${NC}" "$node" "$IP"
     fi
-    
-    printf "%-20.20s | %-15s | %-10s | %s\n" "$host" "$IP" "$STATUS" "$VERDICT"
 done
 echo ""
 EOF
