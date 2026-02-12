@@ -1,88 +1,147 @@
 #!/bin/bash
 
-# Цвета
-G='\033[0;32m'
-R='\033[0;31m'
-Y='\033[1;33m'
-NC='\033[0m'
+# === OpenWrt Xray/V2Ray Checker (GitHub Version) ===
+# Адаптирован для: OpenWrt 24.10 / BusyBox
+# Возможности: Парсинг HTML, декодирование Base64, проверка SSL Handshake
 
+# Цвета
+G='\033[0;32m' # Green
+R='\033[0;31m' # Red
+Y='\033[1;33m' # Yellow
+NC='\033[0m'   # No Color
+
+# 1. Проверка аргументов
 URL="$1"
-# Если аргумента нет, просим ввести
 if [[ -z "$URL" ]]; then
-    echo -e "${Y}=== Xray TCP/SSL Checker (OpenWrt) ===${NC}"
-    read -p "Ссылка: " URL
+    echo -e "${Y}=== Xray Checker (OpenWrt) ===${NC}"
+    read -p "Вставьте ссылку: " URL
 fi
 
+# Если ссылка пустая - выход
 [ -z "$URL" ] && exit 1
 
-# Функция резолва (DNS Google)
+# 2. Функция резолва IP (через Google DNS 8.8.8.8)
+# Это нужно, чтобы обойти локальные блокировки DNS или кэш роутера
 resolve_ip() {
     local host="$1"
+    # Если на входе уже IP - возвращаем его
     if echo "$host" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
         echo "$host"
     else
+        # nslookup для BusyBox (парсим вывод)
         nslookup "$host" 8.8.8.8 2>/dev/null | awk '/^Address: / { print $2 }' | grep -v ":" | tail -n1
     fi
 }
 
-echo -ne "Скачивание списка... "
-RAW=$(curl -sL -k --connect-timeout 10 -A "Mozilla/5.0" "$URL")
+echo -ne "Скачивание... "
+# Скачиваем страницу (прикидываемся браузером Mozilla, чтобы сервер не заблокировал запрос)
+# -k : игнорировать ошибки SSL (нам важно скачать контент)
+# -L : следовать за редиректами
+RAW=$(curl -sL -k --connect-timeout 15 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" "$URL")
 
 if [[ -z "$RAW" ]]; then
-    echo -e "${R}Ошибка скачивания!${NC}"; exit 1;
+    echo -e "${R}Ошибка: Пустой ответ от сервера.${NC}"
+    exit 1
 fi
-echo -e "${G}OK${NC}"
+echo -e "${G}OK (${#RAW} байт)${NC}"
 
-# Очистка и извлечение
-CLEAN=$(echo "$RAW" | sed ':a;N;$!ba;s/\n//g' | sed 's/\r//g' | sed 's/-/+/g' | sed 's/_/\//g')
+# === ЛОГИКА ПАРСИНГА ("ТАНК") ===
+echo -ne "Поиск узлов... "
 
-# Декодинг (если нужно)
-if echo "$RAW" | grep -q "vless://"; then
-    TEXT="$RAW"
+# Шаг 1: Ищем явные ссылки (vless://...) в исходном коде
+LINKS=$(echo "$RAW" | grep -oE '(vless|vmess|trojan|ss|ssr)://[^"'\''<>[:space:]]+')
+
+# Шаг 2: Если ссылок нет, пробуем очистить HTML и декодировать Base64
+if [[ -z "$LINKS" ]]; then
+    # Удаляем все HTML теги (<...>)
+    CLEAN_HTML=$(echo "$RAW" | sed 's/<[^>]*>//g')
+    
+    # Удаляем пробелы и переносы строк
+    CLEAN_TEXT=$(echo "$CLEAN_HTML" | tr -d '\n\r ')
+    
+    # Исправляем URL-safe Base64 символы (- -> +, _ -> /)
+    # Используем sed, так как tr в OpenWrt может капризничать
+    CLEAN_B64=$(echo "$CLEAN_TEXT" | sed 's/-/+/g' | sed 's/_/\//g')
+    
+    # Декодируем (пробуем системный base64)
+    DECODED=$(echo "$CLEAN_B64" | base64 -d 2>/dev/null)
+    
+    # Ищем ссылки внутри декодированного текста
+    LINKS=$(echo "$DECODED" | grep -oE '(vless|vmess|trojan|ss|ssr)://[^"'\''<>[:space:]]+')
+    
+    # Сохраняем текст для поиска доменов (на случай провала)
+    SEARCH_POOL="$RAW $DECODED"
 else
-    DECODED=$(echo "$CLEAN" | base64 -d 2>/dev/null)
-    TEXT="${DECODED:-$RAW}"
+    SEARCH_POOL="$RAW"
 fi
 
-# Поиск хостов (фильтр мусора)
-NODES=$(echo "$TEXT" | grep -oE '[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}|[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | grep -vE '^(vless|vmess|trojan|ss|http|https|tcp|udp|google|github|cloudflare|mozilla|android|apple|microsoft|windows|linux|curl|body|html|div|span|title|head|meta|link|script|true|false|null|ozon|vk|userapi|tradingview)$' | sort -u)
+# Шаг 3: Извлекаем домены (Хосты)
+HOSTS=""
 
-# Фильтр локальных IP
-FINAL_LIST=""
-for node in $NODES; do
-    if echo "$node" | grep -qE '^192\.168\.|^127\.|^10\.|^0\.'; then continue; fi
-    FINAL_LIST+="$node "
-done
+# Если нашли ссылки - парсим их
+if [[ -n "$LINKS" ]]; then
+    for link in $LINKS; do
+        # Убираем протокол (vless://)
+        NOPROTO=$(echo "$link" | sed -E 's/^[a-z]+:\/\///')
+        
+        # Попытка 1: Найти домен между @ и : (стандарт vless)
+        D=$(echo "$NOPROTO" | grep -oE '@[a-zA-Z0-9.-]+' | sed 's/@//')
+        
+        # Попытка 2: Если не вышло (vmess), ищем просто строку похожую на домен
+        if [[ -z "$D" ]]; then
+             D=$(echo "$link" | grep -oE '[a-zA-Z0-9.-]+\.[a-z]{2,}')
+        fi
+        HOSTS+="$D "
+    done
+else
+    # Если ссылок нет вообще - ищем любые домены в тексте (Грубая сила)
+    HOSTS=$(echo "$SEARCH_POOL" | grep -oE '[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}')
+fi
+
+# Шаг 4: Фильтрация мусора
+# Удаляем пустые строки, локальные IP, и слова-исключения (html теги, google, vk и т.д.)
+FINAL_LIST=$(echo "$HOSTS" | tr ' ' '\n' | sort -u | grep -vE "^$|127\.0|192\.168|10\.|0\.0|html|body|div|span|href|src|style|width|height|color|font|script|link|meta|head|title|google|github|cloudflare|vk\.com|ozon|yandex|mail|userapi|tradingview")
 
 COUNT=$(echo "$FINAL_LIST" | wc -w)
-echo -e "${G}Найдено серверов: $COUNT${NC}"
-echo "----------------------------------------------------------------"
-echo -e "Хост                         | IP              | SSL/TCP"
-echo "----------------------------------------------------------------"
 
+if [ "$COUNT" -eq 0 ]; then
+    echo -e "${R}Ничего не найдено.${NC}"
+    echo "Возможные причины:"
+    echo "1. Ссылка ведет на страницу логина/капчи."
+    echo "2. Подписка истекла."
+    echo "3. Формат кодировки неизвестен скрипту."
+    exit 1
+fi
+
+echo -e "${G}Найдено хостов: $COUNT${NC}"
+echo "--------------------------------------------------------"
+printf "%-25s | %-15s | %s\n" "Хост" "IP" "Статус (HTTPS)"
+echo "--------------------------------------------------------"
+
+# Шаг 5: Проверка доступности
 for host in $FINAL_LIST; do
+    # Пропускаем слова короче 4 символов (мусор)
+    if [ ${#host} -lt 4 ]; then continue; fi
+
+    # Резолвим IP
     IP=$(resolve_ip "$host")
     
+    # Если DNS не ответил
     if [[ -z "$IP" ]]; then
-        echo -e "${host} | ??? | DNS Error"
+        # printf "%-25.25s | %-15s | %s\n" "$host" "???" "DNS Error"
         continue
     fi
 
-    # === САМОЕ ГЛАВНОЕ: ПРОВЕРКА CURL ===
-    # -I (только заголовки)
-    # -k (игнорировать ошибки сертификата - нам важен сам факт соединения)
-    # --connect-timeout 3 (если за 3 сек нет ответа - блокировка)
-    # Мы стучимся прямо по IP, чтобы исключить DNS-фокусы
-    
-    if curl -I -k --connect-timeout 3 "https://$IP" >/dev/null 2>&1; then
-        # Если curl вернул 0 (ОК), значит Handshake прошел
-        echo -e "${host} | ${IP} | ${G}ALIVE (Работает)${NC}"
+    # Проверка CURL (SSL Handshake)
+    # Мы проверяем именно HTTPS порт 443. 
+    # Если РКН блокирует - будет таймаут или ошибка соединения.
+    if curl -I -k --connect-timeout 2 "https://$IP" >/dev/null 2>&1; then
+        STATUS="${G}ALIVE${NC}"
     else
-        # Если таймаут или сброс
-        echo -e "${host} | ${IP} | ${R}BLOCKED (РКН)${NC}"
+        STATUS="${R}BLOCKED${NC}"
     fi
+    
+    printf "%-25.25s | %-15s | %s\n" "$host" "$IP" "$STATUS"
 done
-echo ""
-EOF
 
-chmod +x /usr/bin/xcheck
+echo ""
