@@ -1,106 +1,103 @@
 #!/bin/bash
+# TC|_|Y v0.1.3.9 - Упрощённая версия, фикс нулевых байтов
 
-# Цвета для вывода
-G='\033[0;32m'
-R='\033[0;31m'
-NC='\033[0m'
+G='\033[0;32m'; R='\033[0;31m'; B='\033[0;34m'; Y='\033[1;33m'; NC='\033[0m'
 
-echo -e "=== OpenWrt V2Ray Fix (No-TR version) ==="
-read -p "Вставьте ссылку: " URL
+read -p "Укажите ссылку или домен: " INPUT
 
-# Функция для получения IP (работает на OpenWrt/BusyBox)
 get_ip() {
-    local host="$1"
-    # Если это уже IP
-    if echo "$host" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
-        echo "$host"
+    local target=$(echo "$1" | tr -d '"'\''/ ')
+    if [[ "$target" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        echo "$target"
     else
-        # nslookup для BusyBox
-        nslookup "$host" 2>/dev/null | awk '/^Address: / { print $2 }' | grep -v ":" | tail -n1
+        host -t A "$target" 2>/dev/null | grep -oE "([0-9]{1,3}\.){3}[0-9]{1,3}" | head -n1
     fi
 }
 
-echo -ne "Скачивание... "
-# Скачиваем с таймаутом и пропуском проверки SSL (-k)
-RAW=$(curl -sL -k --connect-timeout 10 -A "Mozilla/5.0" "$URL")
-
-if [[ -z "$RAW" ]]; then
-    echo -e "${R}Ошибка: Пустой ответ от сервера.${NC}"
-    exit 1
-fi
-echo -e "${G}OK (${#RAW} байт)${NC}"
-
-# === ИСПРАВЛЕННАЯ ЧАСТЬ (БЕЗ TR) ===
-echo -ne "Декодирование... "
-
-# 1. Удаляем переносы строк (используем tr только для удаления, это безопасно)
-CLEAN=$(echo "$RAW" | tr -d '\n\r ')
-
-# 2. Заменяем URL-safe символы.
-# ВМЕСТО tr '_-' '/+' ИСПОЛЬЗУЕМ SED. Это решает вашу ошибку.
-CLEAN=$(echo "$CLEAN" | sed 's/-/+/g' | sed 's/_/\//g')
-
-# 3. Добавляем "padding" (=), если строка не кратна 4
-LEN=${#CLEAN}
-MOD=$((LEN % 4))
-if [ $MOD -eq 2 ]; then CLEAN="${CLEAN}=="; fi
-if [ $MOD -eq 3 ]; then CLEAN="${CLEAN}="; fi
-
-# 4. Декодируем
-# Пробуем полную версию base64, затем встроенную
-if [ -x /usr/bin/base64 ]; then
-    DECODED=$(echo "$CLEAN" | /usr/bin/base64 -d 2>/dev/null)
-else
-    DECODED=$(echo "$CLEAN" | base64 -d 2>/dev/null)
-fi
-
-# Проверка результата
-if [[ -n "$DECODED" ]]; then
-    echo -e "${G}Успешно${NC}"
-    SEARCH_TEXT="$DECODED"
-else
-    echo -e "${R}Не вышло (пробуем искать в сыром тексте)${NC}"
-    SEARCH_TEXT="$RAW"
-fi
-
-# === ПОИСК СЕРВЕРОВ ===
-echo "Поиск узлов..."
-
-# Ищем строки, похожие на домены или IP
-NODES=$(echo "$SEARCH_TEXT" | grep -oE '[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}|[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | grep -vE '^(vless|vmess|trojan|ss|tcp|udp|http|https|www|google|github|cloudflare|mozilla|android|apple|microsoft|windows|linux|curl|body|html|div|span|title|head|meta|link|script)$' | sort -u)
-
-# Фильтруем пустые строки и локальные IP
-FINAL_LIST=""
-for node in $NODES; do
-    if echo "$node" | grep -qE '^192\.168\.|^127\.|^10\.|^0\.'; then continue; fi
-    FINAL_LIST+="$node "
-done
-
-if [[ -z "$FINAL_LIST" ]]; then
-    echo -e "${R}Узлы не найдены!${NC}"
-    echo "Возможно, ссылка ведет на страницу с капчей или формат подписки неизвестен."
-    exit 1
-fi
-
-# === ПРОВЕРКА ===
-printf "\n%-25s | %-15s | %s\n" "Хост" "IP" "Статус (Порт 443)"
-echo "------------------------------------------------------------"
-
-for host in $FINAL_LIST; do
-    # Получаем IP
-    IP=$(get_ip "$host")
+if [[ $INPUT == http* ]]; then
+    echo -ne "${B}==> Получение данных... ${NC}"
     
-    if [[ -z "$IP" ]]; then
-        printf "%-25.25s | %-15s | %s\n" "$host" "???" "DNS Error"
-        continue
+    # Основной запрос
+    BODY=$(curl -sL -k -A "Happ/2.0.5/Linux" --connect-timeout 15 --max-time 30 "$INPUT" 2>/dev/null)
+    
+    # Если пусто, пробуем с другим UA
+    if [[ -z "$BODY" ]]; then
+        BODY=$(curl -sL -k -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" --connect-timeout 15 "$INPUT" 2>/dev/null)
     fi
+    
+    echo -e "${G}DONE${NC}"
+    
+    NODES_LIST=""
+    
+    # 1. VLESS/vmess/trojan/SS URL напрямую
+    NODES_LIST+=$(echo "$BODY" | grep -oE '(vless|vmess|trojan|ss|ssr)://[^@]+@[^:/]+' | sed -E 's/.*@//' | cut -d':' -f1)
+    NODES_LIST+=$'\n'
+    
+    # 2. Декодируем Base64 и ищем URL
+    DECODED=$(echo "$BODY" | tr '_-' '/+' | base64 -d 2>/dev/null)
+    if [[ -n "$DECODED" ]]; then
+        NODES_LIST+=$(echo "$DECODED" | grep -oE '(vless|vmess|trojan|ss|ssr)://[^@]+@[^:/]+' | sed -E 's/.*@//' | cut -d':' -f1)
+        NODES_LIST+=$'\n'
+        NODES_LIST+=$(echo "$DECODED" | grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b')
+        NODES_LIST+=$'\n'
+        NODES_LIST+=$(echo "$DECODED" | grep -oE '[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}' | grep -vE '^(null|true|false)$')
+    fi
+    
+    # 3. JSON поля
+    NODES_LIST+=$(echo "$BODY" | grep -oE '"add"[[:space:]]*:[[:space:]]*"[^"]*"' | grep -oE '"[^"]+"$' | tr -d '"')
+    NODES_LIST+=$'\n'
+    NODES_LIST+=$(echo "$BODY" | grep -oE '"host"[[:space:]]*:[[:space:]]*"[^"]*"' | grep -oE '"[^"]+"$' | tr -d '"')
+    NODES_LIST+=$'\n'
+    
+    # 4. Домены и IP напрямую из body
+    NODES_LIST+=$(echo "$BODY" | grep -oE '[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}' | grep -vE '^(null|true|false|www|api|cdn|http|https|github|google|cloudflare|nginx|title|body|center|hr)$')
+    NODES_LIST+=$'\n'
+    NODES_LIST+=$(echo "$BODY" | grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' | grep -vE '^(0\.0\.0\.0|127\.|192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.)')
+    
+    NODES_LIST=$(echo "$NODES_LIST" | sort -u | grep -v '^$')
+    
+else
+    echo -ne "${B}==> Разведка домена... ${NC}"
+    NODES_LIST=$(curl -s --connect-timeout 8 "https://crt.sh/?q=%25.$INPUT&output=json" | jq -r '.[].name_value' 2>/dev/null | sed 's/\*\.//g' | tr ' ' '\n' | sort -u)
+    [[ -z "$NODES_LIST" || "$NODES_LIST" == "null" ]] && NODES_LIST="$INPUT"
+    echo -e "${G}OK${NC}"
+fi
 
-    # Проверяем порт 443 через netcat (nc)
-    if nc -z -w 3 "$IP" 443 2>/dev/null; then
-        echo -e "${G}%-25.25s | %-15s | OPEN${NC}" "$host" "$IP"
-    else
-        echo -e "${R}%-25.25s | %-15s | FAIL${NC}" "$host" "$IP"
-    fi
+declare -A DNS_MAP; FINAL_IPS=""
+for d in $NODES_LIST; do
+    IP=$(get_ip "$d")
+    [[ ! -z "$IP" && "$IP" != "0.0.0.0" ]] && { DNS_MAP[$IP]=$d; FINAL_IPS+="$IP "; }
 done
+
+NODES=($(echo "$FINAL_IPS" | tr ' ' '\n' | sort -u))
+[[ ${#NODES[@]} -eq 0 ]] && { echo -e "${R}Ошибка: Узлы не найдены.${NC}"; exit 1; }
+
+printf "\n${B}%-15s | %-30s | %-6s | %-4s | %-10s | %s${NC}\n" "IP Адрес" "Источник / Хост" "Статус" "Гео" "ASN" "Вердикт"
+echo "----------------------------------------------------------------------------------------------------------"
+
+audit_node() {
+    local ip=$1; local name=$2
+    (echo >/dev/tcp/"$ip"/443) &>/dev/null && ST="OK" || ST="BANNED"
+    
+    RAW=$(curl -s --connect-timeout 3 "http://ip-api.com/csv/$ip?fields=countryCode,as" 2>/dev/null)
+    CO=$(echo "$RAW" | cut -d',' -f1 | tr -d '"')
+    AS=$(echo "$RAW" | cut -d',' -f2 | tr -d '"')
+    
+    AS_NUM=$(echo "$AS" | grep -oE '^AS[0-9]+')
+    [[ -z "$CO" ]] && CO="??"
+    [[ -z "$AS_NUM" ]] && AS_NUM="AS???"
+    
+    VERDICT=$([[ "$ST" == "OK" ]] && echo "Alive / Pass" || echo "TSP_DROP / Blocked")
+    
+    echo "$ip|$name|$ST|$CO|$AS_NUM|$VERDICT"
+}
+
+export -f audit_node; export G R B Y NC
+for ip in "${NODES[@]}"; do 
+    echo "$ip ${DNS_MAP[$ip]}"
+done | xargs -P 15 -n 2 bash -c 'audit_node "$0" "$1"' | while IFS='|' read -r ip name st co as verdict; do
+    [[ "$st" == "OK" ]] && C=$G || C=$R
+    printf "${C}%-15s | %-30.30s | %-6s | [%-2s] | %-10s | %s${NC}\n" "$ip" "$name" "$st" "$co" "$as" "$verdict"
+done
+
 echo ""
-EOF
