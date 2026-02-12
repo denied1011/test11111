@@ -1,97 +1,105 @@
 #!/bin/bash
 
-# Цвета
-G='\033[0;32m'; R='\033[0;31m'; NC='\033[0m'
+# Цвета для вывода
+G='\033[0;32m'
+R='\033[0;31m'
+NC='\033[0m'
 
-echo -e "${G}=== OpenWrt Checker (No-TR / Direct DNS) ===${NC}"
-read -p "Ссылка: " URL
+echo -e "=== OpenWrt V2Ray Fix (No-TR version) ==="
+read -p "Вставьте ссылку: " URL
 
-# Функция резолва напрямую через Google DNS (обход локального DNS/Подкопа)
-resolve_ip() {
+# Функция для получения IP (работает на OpenWrt/BusyBox)
+get_ip() {
     local host="$1"
-    # Если это IP - возвращаем как есть
+    # Если это уже IP
     if echo "$host" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
         echo "$host"
     else
-        # Запрос к 8.8.8.8, тайм-аут 2 сек
-        nslookup "$host" 8.8.8.8 2>/dev/null | awk '/^Address: / { print $2 }' | grep -v ":" | tail -n1
+        # nslookup для BusyBox
+        nslookup "$host" 2>/dev/null | awk '/^Address: / { print $2 }' | grep -v ":" | tail -n1
     fi
 }
 
 echo -ne "Скачивание... "
-# Скачиваем с User-Agent браузера
+# Скачиваем с таймаутом и пропуском проверки SSL (-k)
 RAW=$(curl -sL -k --connect-timeout 10 -A "Mozilla/5.0" "$URL")
 
 if [[ -z "$RAW" ]]; then
-    echo -e "${R}ОШИБКА: Пустой ответ!${NC}"
-    echo "Curl не смог скачать данные. Проверьте интернет или ссылку."
+    echo -e "${R}Ошибка: Пустой ответ от сервера.${NC}"
     exit 1
 fi
 echo -e "${G}OK (${#RAW} байт)${NC}"
 
-# === ОТЛАДКА: ЧТО МЫ СКАЧАЛИ? ===
-echo "Начало файла: ${RAW:0:60}..." 
-# ================================
+# === ИСПРАВЛЕННАЯ ЧАСТЬ (БЕЗ TR) ===
+echo -ne "Декодирование... "
 
-echo -ne "Обработка данных... "
+# 1. Удаляем переносы строк (используем tr только для удаления, это безопасно)
+CLEAN=$(echo "$RAW" | tr -d '\n\r ')
 
-# 1. Чистим текст (sed вместо tr)
-# Удаляем переносы строк
-CLEAN=$(echo "$RAW" | sed ':a;N;$!ba;s/\n//g')
-# Заменяем URL-safe символы (+ и /)
+# 2. Заменяем URL-safe символы.
+# ВМЕСТО tr '_-' '/+' ИСПОЛЬЗУЕМ SED. Это решает вашу ошибку.
 CLEAN=$(echo "$CLEAN" | sed 's/-/+/g' | sed 's/_/\//g')
 
-# 2. Декодируем
-# Пробуем coreutils-base64 (он лучше), если нет - встроенный
-if [ -f /usr/bin/base64 ]; then
+# 3. Добавляем "padding" (=), если строка не кратна 4
+LEN=${#CLEAN}
+MOD=$((LEN % 4))
+if [ $MOD -eq 2 ]; then CLEAN="${CLEAN}=="; fi
+if [ $MOD -eq 3 ]; then CLEAN="${CLEAN}="; fi
+
+# 4. Декодируем
+# Пробуем полную версию base64, затем встроенную
+if [ -x /usr/bin/base64 ]; then
     DECODED=$(echo "$CLEAN" | /usr/bin/base64 -d 2>/dev/null)
 else
-    # Добавляем паддинг вручную для BusyBox base64
-    LEN=${#CLEAN}
-    MOD=$((LEN % 4))
-    if [ $MOD -eq 2 ]; then CLEAN="${CLEAN}=="; fi
-    if [ $MOD -eq 3 ]; then CLEAN="${CLEAN}="; fi
     DECODED=$(echo "$CLEAN" | base64 -d 2>/dev/null)
 fi
 
-# Если декодирование не дало результата, используем сырой текст
-if [[ -z "$DECODED" ]]; then
-    WORK_TEXT="$RAW"
+# Проверка результата
+if [[ -n "$DECODED" ]]; then
+    echo -e "${G}Успешно${NC}"
+    SEARCH_TEXT="$DECODED"
 else
-    WORK_TEXT="$DECODED"
+    echo -e "${R}Не вышло (пробуем искать в сыром тексте)${NC}"
+    SEARCH_TEXT="$RAW"
 fi
 
-# 3. Парсинг (выдираем всё, что похоже на домен или IP)
-# Ищем строки вида example.com или 1.2.3.4
-NODES=$(echo "$WORK_TEXT" | grep -oE '[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}|[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | grep -vE '^(vless|vmess|trojan|ss|http|https|tcp|udp|google|github|cloudflare|mozilla|android|apple|microsoft|windows|linux|curl|body|html|div|span|title|head|meta|link|script)$' | sort -u)
+# === ПОИСК СЕРВЕРОВ ===
+echo "Поиск узлов..."
 
-if [[ -z "$NODES" ]]; then
+# Ищем строки, похожие на домены или IP
+NODES=$(echo "$SEARCH_TEXT" | grep -oE '[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}|[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | grep -vE '^(vless|vmess|trojan|ss|tcp|udp|http|https|www|google|github|cloudflare|mozilla|android|apple|microsoft|windows|linux|curl|body|html|div|span|title|head|meta|link|script)$' | sort -u)
+
+# Фильтруем пустые строки и локальные IP
+FINAL_LIST=""
+for node in $NODES; do
+    if echo "$node" | grep -qE '^192\.168\.|^127\.|^10\.|^0\.'; then continue; fi
+    FINAL_LIST+="$node "
+done
+
+if [[ -z "$FINAL_LIST" ]]; then
     echo -e "${R}Узлы не найдены!${NC}"
-    echo "Скрипт не смог найти домены или IP в ответе сервера."
+    echo "Возможно, ссылка ведет на страницу с капчей или формат подписки неизвестен."
     exit 1
 fi
-echo -e "${G}Найдено потенциальных узлов: $(echo "$NODES" | wc -l)${NC}"
 
-echo -e "\nПроверка доступности (через Google DNS)..."
-printf "%-25s | %-15s | %s\n" "Хост" "IP" "Статус 443"
-echo "--------------------------------------------------------"
+# === ПРОВЕРКА ===
+printf "\n%-25s | %-15s | %s\n" "Хост" "IP" "Статус (Порт 443)"
+echo "------------------------------------------------------------"
 
-for node in $NODES; do
-    # Пропускаем явно локальные IP
-    if echo "$node" | grep -qE '^192\.168\.|^127\.|^10\.'; then continue; fi
-
-    IP=$(resolve_ip "$node")
+for host in $FINAL_LIST; do
+    # Получаем IP
+    IP=$(get_ip "$host")
     
     if [[ -z "$IP" ]]; then
-        printf "%-25.25s | %-15s | %s\n" "$node" "???" "DNS Error"
+        printf "%-25.25s | %-15s | %s\n" "$host" "???" "DNS Error"
         continue
     fi
 
-    # Проверка порта
+    # Проверяем порт 443 через netcat (nc)
     if nc -z -w 3 "$IP" 443 2>/dev/null; then
-        echo -e "${G}%-25.25s | %-15s | OPEN${NC}" "$node" "$IP"
+        echo -e "${G}%-25.25s | %-15s | OPEN${NC}" "$host" "$IP"
     else
-        echo -e "${R}%-25.25s | %-15s | FAIL${NC}" "$node" "$IP"
+        echo -e "${R}%-25.25s | %-15s | FAIL${NC}" "$host" "$IP"
     fi
 done
 echo ""
